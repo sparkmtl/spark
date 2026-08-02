@@ -1,0 +1,11 @@
+{
+  "dart.flutterSdkPath": "D:\\flutter",
+  "terminal.integrated.env.windows": {
+    "PATH": "D:\\flutter\\bin;${env:PATH}",
+    "PUB_CACHE": "D:\\dev-cache\\Pub",
+    "TEMP": "D:\\dev-cache\\Temp",
+    "TMP": "D:\\dev-cache\\Temp",
+    "ANDROID_HOME": "D:\\Android\\Sdk",
+    "ANDROID_SDK_ROOT": "D:\\Android\\Sdk"
+  }
+}
