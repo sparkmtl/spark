@@ -2,11 +2,15 @@ import 'package:flutter/foundation.dart';
 
 import '../models/login_model.dart';
 import '../services/auth_api.dart';
+import '../services/auth_session.dart';
 
 class LoginController extends ChangeNotifier {
-  LoginController({AuthApi? authApi}) : _authApi = authApi ?? AuthApi();
+  LoginController({AuthApi? authApi, AuthSession? session})
+      : _authApi = authApi ?? AuthApi(),
+        _session = session ?? AuthSession.instance;
 
   final AuthApi _authApi;
+  final AuthSession _session;
 
   LoginModel _model = const LoginModel();
   Map<String, String> _errors = {};
@@ -46,10 +50,11 @@ class LoginController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _authApi.login(
+      final result = await _authApi.login(
         usernameOrEmail: _model.email.trim(),
         password: _model.password,
       );
+      _session.setSession(accessToken: result.accessToken);
       return true;
     } on ApiException catch (e) {
       if (e.fieldErrors != null && e.fieldErrors!.isNotEmpty) {

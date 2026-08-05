@@ -21,6 +21,8 @@ class SparkTextField extends StatelessWidget {
     this.suffix,
     this.inputFormatters,
     this.maxLength,
+    this.maxLines = 1,
+    this.minLines,
   });
 
   final String hint;
@@ -38,6 +40,8 @@ class SparkTextField extends StatelessWidget {
   final Widget? suffix;
   final List<TextInputFormatter>? inputFormatters;
   final int? maxLength;
+  final int? maxLines;
+  final int? minLines;
 
   @override
   Widget build(BuildContext context) {
@@ -52,6 +56,8 @@ class SparkTextField extends StatelessWidget {
       enableSuggestions: enableSuggestions,
       inputFormatters: inputFormatters,
       maxLength: maxLength,
+      maxLines: obscureText ? 1 : maxLines,
+      minLines: minLines,
       style: Theme.of(context).textTheme.bodyLarge,
       cursorColor: SparkColors.accent,
       onChanged: onChanged,
@@ -61,6 +67,7 @@ class SparkTextField extends StatelessWidget {
         errorText: errorText,
         suffixIcon: suffix,
         counterText: '',
+        alignLabelWithHint: (maxLines ?? 1) > 1,
       ),
     );
   }

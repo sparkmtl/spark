@@ -45,7 +45,7 @@ class _LoginViewState extends State<LoginView> {
     final ok = await _controller.submit();
     if (!mounted || !ok) return;
 
-    Navigator.of(context).pushNamedAndRemoveUntil('/welcome', (_) => false);
+    Navigator.of(context).pushNamedAndRemoveUntil('/home', (_) => false);
   }
 
   void _goForgotPassword() {
