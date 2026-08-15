@@ -42,9 +42,10 @@ abstract final class LocationService {
 
       final position = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
+          accuracy: LocationAccuracy.medium,
+          timeLimit: Duration(seconds: 12),
         ),
-      );
+      ).timeout(const Duration(seconds: 15));
       return LocationResult.success(position);
     } catch (_) {
       return const LocationResult.failure(LocationFailure.unknown);
