@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local Mapbox token (see map_secrets.example.dart)
+lib/services/map_secrets.dart
