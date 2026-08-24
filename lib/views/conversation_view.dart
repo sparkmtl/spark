@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../models/chat_message_model.dart';
 import '../services/chat_api.dart';
 import '../theme/spark_colors.dart';
+import '../widgets/spark_snackbar.dart';
 import '../widgets/spark_text_field.dart';
 
 /// A single 1:1 conversation thread, opened from the Map (or, later, from a
@@ -93,9 +94,7 @@ class _ConversationViewState extends State<ConversationView> {
       _scrollToBottom();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Couldn't send message. Try again.")),
-      );
+      showSparkSnackBar(context, "Couldn't send message. Try again.");
     } finally {
       if (mounted) setState(() => _isSending = false);
     }

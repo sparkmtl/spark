@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -127,7 +128,11 @@ class AuthApi {
             },
             body: jsonEncode(body),
           )
-          .timeout(const Duration(seconds: 45));
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw ApiException(
+        'Request timed out. Make sure spark-api and PostgreSQL are running.',
+      );
     } catch (e) {
       debugPrint('AuthApi request to $uri failed: $e');
       throw ApiException(
@@ -146,7 +151,7 @@ class AuthApi {
 
     if (!successStatuses.contains(response.statusCode)) {
       throw ApiException(
-        json['message'] as String? ?? 'Request failed (${response.statusCode})',
+        _messageForStatus(response.statusCode, json),
         statusCode: response.statusCode,
         fieldErrors: _parseFieldErrors(json['errors']),
       );
@@ -158,5 +163,18 @@ class AuthApi {
   Map<String, String>? _parseFieldErrors(Object? raw) {
     if (raw is! Map) return null;
     return raw.map((key, value) => MapEntry('$key', '$value'));
+  }
+
+  String _messageForStatus(int statusCode, Map<String, dynamic> json) {
+    final serverMessage = json['message'] as String?;
+    if (serverMessage != null && serverMessage.isNotEmpty) {
+      return serverMessage;
+    }
+    return switch (statusCode) {
+      401 => 'Invalid email or password.',
+      503 => 'Server is temporarily unavailable. Try again in a moment.',
+      >= 500 => 'Server error. Make sure spark-api and PostgreSQL are running.',
+      _ => 'Request failed ($statusCode).',
+    };
   }
 }
