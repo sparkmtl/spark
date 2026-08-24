@@ -1,14 +1,20 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../models/map_user_model.dart';
 import '../services/chat_api.dart';
+import '../services/check_in_api.dart';
+import '../services/auth_api.dart';
 import '../services/location_service.dart';
 import '../services/map_api.dart';
 import '../services/map_config.dart';
 import '../theme/spark_colors.dart';
 import '../widgets/map_heat_layer.dart';
+import '../widgets/spark_snackbar.dart';
 import 'conversation_view.dart';
 
 /// Below this zoom, show density heat only (Snap Map style). At/above it,
@@ -26,6 +32,7 @@ class _MapViewState extends State<MapView> {
   final MapController _mapController = MapController();
   final MapApi _mapApi = MapApi();
   final ChatApi _chatApi = ChatApi();
+  final CheckInApi _checkInApi = CheckInApi();
 
   LatLng _center = const LatLng(
     MapConfig.fallbackLatitude,
@@ -37,6 +44,17 @@ class _MapViewState extends State<MapView> {
   List<MapUserModel> _nearbyUsers = [];
   bool _isStartingConversation = false;
   double _mapZoom = MapConfig.defaultZoom;
+
+  bool _isCheckedIn = false;
+  bool _isCheckInBusy = false;
+  String? _checkInMessage;
+  LatLng? _checkInAnchor;
+  List<MapUserModel> _checkedInUsers = [];
+  StreamSubscription<Position>? _positionSub;
+  Timer? _checkInPollTimer;
+  Timer? _statusMessageTimer;
+  DateTime? _lastLocationPushAt;
+  LatLng? _lastPushedLocation;
 
   bool get _showIndividualMarkers => _mapZoom >= _markerRevealZoom;
 
@@ -55,11 +73,70 @@ class _MapViewState extends State<MapView> {
     super.initState();
     _locateUser();
     _loadNearbyUsers();
+    _restoreCheckInStatus();
+  }
+
+  Future<void> _restoreCheckInStatus() async {
+    try {
+      final status = await _checkInApi.getCheckInStatus();
+      if (!mounted || !status.checkedIn) return;
+
+      final anchor = status.anchorLatitude != null &&
+              status.anchorLongitude != null
+          ? LatLng(status.anchorLatitude!, status.anchorLongitude!)
+          : null;
+
+      setState(() {
+        _isCheckedIn = true;
+        _checkInAnchor = anchor;
+      });
+      _showCheckInMessage('Checked in — sharing live location');
+      _startLocationTracking();
+      _startCheckInPolling();
+      _loadCheckedInUsers();
+    } catch (_) {
+      // Best-effort restore; user can check in again manually.
+    }
+  }
+
+  /// Shows a transient status pill that clears itself after [_notificationDuration].
+  void _showCheckInMessage(String message) {
+    _statusMessageTimer?.cancel();
+    setState(() {
+      _checkInMessage = message;
+      _locationMessage = null;
+    });
+    _statusMessageTimer = Timer(kSparkNotificationDuration, () {
+      if (!mounted) return;
+      setState(() {
+        if (_checkInMessage == message) {
+          _checkInMessage = null;
+        }
+      });
+    });
+  }
+
+  void _showLocationMessage(String message) {
+    _statusMessageTimer?.cancel();
+    setState(() {
+      _locationMessage = message;
+      _checkInMessage = null;
+    });
+    _statusMessageTimer = Timer(kSparkNotificationDuration, () {
+      if (!mounted) return;
+      setState(() {
+        if (_locationMessage == message) {
+          _locationMessage = null;
+        }
+      });
+    });
   }
 
   Future<void> _locateUser({bool showMessages = false}) async {
+    _statusMessageTimer?.cancel();
     setState(() {
       _isLocating = true;
+      _checkInMessage = null;
       _locationMessage = null;
     });
 
@@ -81,14 +158,17 @@ class _MapViewState extends State<MapView> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _mapController.move(location, MapConfig.defaultZoom);
       });
-      _shareLocation(location);
+      _lastLocationPushAt = DateTime.now();
+      _lastPushedLocation = location;
+      await _shareLocation(location);
+      _startLocationTracking();
     } else {
       setState(() {
         _isLocating = false;
-        _locationMessage = showMessages
-            ? _messageFor(result.failure!)
-            : null;
       });
+      if (showMessages) {
+        _showLocationMessage(_messageFor(result.failure!));
+      }
     }
   }
 
@@ -113,6 +193,246 @@ class _MapViewState extends State<MapView> {
       });
     } catch (_) {
       // Keep whatever markers we already have; fail silently on the map.
+    }
+  }
+
+  Future<void> _loadCheckedInUsers() async {
+    if (!_isCheckedIn) return;
+    try {
+      final users = await _checkInApi.getCheckedInUsers();
+      if (!mounted) return;
+      setState(() {
+        _checkedInUsers = users;
+      });
+    } catch (_) {
+      // Keep existing checked-in markers on transient failures.
+    }
+  }
+
+  Future<void> _toggleCheckIn() async {
+    if (_isCheckInBusy) return;
+    if (_isCheckedIn) {
+      await _performCheckOut(manual: true);
+    } else {
+      await _performCheckIn();
+    }
+  }
+
+  Future<void> _performCheckIn() async {
+    _statusMessageTimer?.cancel();
+    setState(() {
+      _isCheckInBusy = true;
+      _checkInMessage = null;
+    });
+
+    final result = await LocationService.getCurrentLocation();
+    if (!mounted) return;
+
+    if (!result.isSuccess) {
+      setState(() {
+        _isCheckInBusy = false;
+      });
+      _showLocationMessage(_messageFor(result.failure!));
+      return;
+    }
+
+    final position = result.position!;
+    final location = LatLng(position.latitude, position.longitude);
+
+    try {
+      final status = await _checkInApi.checkIn(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+      if (!mounted) return;
+
+      setState(() {
+        _isCheckedIn = status.checkedIn;
+        _checkInAnchor = status.anchorLatitude != null &&
+                status.anchorLongitude != null
+            ? LatLng(status.anchorLatitude!, status.anchorLongitude!)
+            : location;
+        _userLocation = location;
+        _isCheckInBusy = false;
+      });
+      _showCheckInMessage('Checked in — sharing live location');
+      _startLocationTracking();
+      _startCheckInPolling();
+      _loadCheckedInUsers();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isCheckInBusy = false;
+      });
+      if (e.statusCode == 409) {
+        _showCheckInMessage('Already checked in');
+        await _syncCheckInStateFromServer();
+        return;
+      }
+      _showCheckInMessage("Couldn't check in. Try again.");
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isCheckInBusy = false;
+      });
+      _showCheckInMessage("Couldn't check in. Try again.");
+    }
+  }
+
+  /// Aligns local check-in UI with [CheckInApi.getCheckInStatus].
+  Future<void> _syncCheckInStateFromServer() async {
+    try {
+      final status = await _checkInApi.getCheckInStatus();
+      if (!mounted) return;
+
+      if (!status.checkedIn) {
+        _stopCheckInPolling();
+        setState(() {
+          _isCheckedIn = false;
+          _checkInAnchor = null;
+          _checkedInUsers = [];
+        });
+        return;
+      }
+
+      final anchor = status.anchorLatitude != null &&
+              status.anchorLongitude != null
+          ? LatLng(status.anchorLatitude!, status.anchorLongitude!)
+          : null;
+
+      setState(() {
+        _isCheckedIn = true;
+        _checkInAnchor = anchor;
+        if (status.latitude != null && status.longitude != null) {
+          _userLocation = LatLng(status.latitude!, status.longitude!);
+        }
+      });
+      _startLocationTracking();
+      _startCheckInPolling();
+      _loadCheckedInUsers();
+    } catch (_) {
+      // Keep whatever local state we already have.
+    }
+  }
+
+  Future<void> _performCheckOut({
+    required bool manual,
+    bool autoCheckedOut = false,
+  }) async {
+    setState(() {
+      _isCheckInBusy = true;
+    });
+
+    // Keep the GPS stream running so map location continues to update.
+    _stopCheckInPolling();
+
+    try {
+      if (_isCheckedIn) {
+        await _checkInApi.checkOut();
+      }
+    } catch (_) {
+      // Still clear local state so the UI reflects checkout.
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isCheckedIn = false;
+      _checkInAnchor = null;
+      _checkedInUsers = [];
+      _isCheckInBusy = false;
+    });
+
+    if (autoCheckedOut) {
+      _showCheckInMessage('Moved 1 km away — checked out');
+    } else {
+      _statusMessageTimer?.cancel();
+      setState(() {
+        _checkInMessage = null;
+        _locationMessage = null;
+      });
+    }
+  }
+
+  /// Starts continuous GPS updates for the lifetime of this map (logged-in shell).
+  void _startLocationTracking() {
+    if (_positionSub != null) return;
+
+    _positionSub = LocationService.getPositionStream().listen(
+      _onPositionUpdate,
+      onError: (_) {},
+    );
+  }
+
+  void _stopLocationTracking() {
+    _positionSub?.cancel();
+    _positionSub = null;
+  }
+
+  void _startCheckInPolling() {
+    _stopCheckInPolling();
+    _checkInPollTimer = Timer.periodic(
+      const Duration(seconds: 4),
+      (_) => _loadCheckedInUsers(),
+    );
+  }
+
+  void _stopCheckInPolling() {
+    _checkInPollTimer?.cancel();
+    _checkInPollTimer = null;
+  }
+
+  Future<void> _onPositionUpdate(Position position) async {
+    final location = LatLng(position.latitude, position.longitude);
+
+    if (mounted) {
+      setState(() => _userLocation = location);
+    }
+
+    // Check-in auto-checkout and live check-in location sharing.
+    if (_isCheckedIn && _checkInAnchor != null) {
+      final distanceKm =
+          LocationService.distanceKm(_checkInAnchor!, location);
+
+      if (distanceKm >= checkInAutoCheckoutRadiusKm) {
+        await _performCheckOut(manual: false, autoCheckedOut: true);
+        return;
+      }
+    }
+
+    final now = DateTime.now();
+    final shouldPush = _lastLocationPushAt == null ||
+        now.difference(_lastLocationPushAt!) >= const Duration(seconds: 15) ||
+        _lastPushedLocation == null ||
+        LocationService.distanceKm(_lastPushedLocation!, location) >= 0.025;
+
+    if (!shouldPush) return;
+
+    _lastLocationPushAt = now;
+    _lastPushedLocation = location;
+
+    // Always share map location while logged in and tracking.
+    try {
+      await _mapApi.updateLocation(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+    } catch (_) {
+      // Best-effort map location updates.
+    }
+
+    if (!_isCheckedIn) return;
+
+    try {
+      final result = await _checkInApi.updateCheckInLocation(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+
+      if (result.autoCheckedOut) {
+        await _performCheckOut(manual: false, autoCheckedOut: true);
+      }
+    } catch (_) {
+      // Best-effort live check-in updates.
     }
   }
 
@@ -167,8 +487,9 @@ class _MapViewState extends State<MapView> {
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Couldn't start the conversation. Try again.")),
+      showSparkSnackBar(
+        context,
+        "Couldn't start the conversation. Try again.",
       );
     } finally {
       if (mounted) setState(() => _isStartingConversation = false);
@@ -177,6 +498,9 @@ class _MapViewState extends State<MapView> {
 
   @override
   void dispose() {
+    _statusMessageTimer?.cancel();
+    _stopCheckInPolling();
+    _stopLocationTracking();
     _mapController.dispose();
     super.dispose();
   }
@@ -250,6 +574,23 @@ class _MapViewState extends State<MapView> {
                     ],
                   ),
               ],
+              if (_isCheckedIn && _showIndividualMarkers)
+                MarkerLayer(
+                  markers: [
+                    for (final user in _checkedInUsers)
+                      Marker(
+                        point: LatLng(user.latitude, user.longitude),
+                        width: 64,
+                        height: 64,
+                        alignment: Alignment.center,
+                        child: _NearbyUserMarker(
+                          user: user,
+                          onTap: () => _showUserDetails(user),
+                          showLiveBadge: true,
+                        ),
+                      ),
+                  ],
+                ),
               if (_userLocation != null)
                 MarkerLayer(
                   markers: [
@@ -275,6 +616,18 @@ class _MapViewState extends State<MapView> {
                 showSpinner: true,
               ),
             )
+          else if (_checkInMessage != null)
+            Positioned(
+              top: 16,
+              left: 16,
+              right: 16,
+              child: _StatusPill(
+                icon: _isCheckedIn
+                    ? Icons.location_on
+                    : Icons.location_off_outlined,
+                label: _checkInMessage!,
+              ),
+            )
           else if (_locationMessage != null)
             Positioned(
               top: 16,
@@ -293,6 +646,15 @@ class _MapViewState extends State<MapView> {
             child: Column(
               children: [
                 _MapButton(
+                  icon: _isCheckedIn
+                      ? Icons.location_on
+                      : Icons.location_on_outlined,
+                  isPrimary: _isCheckedIn,
+                  showSpinner: _isCheckInBusy,
+                  onPressed: _isCheckInBusy ? null : _toggleCheckIn,
+                ),
+                const SizedBox(height: 10),
+                _MapButton(
                   icon: Icons.add,
                   onPressed: () => _zoomBy(1),
                 ),
@@ -310,13 +672,6 @@ class _MapViewState extends State<MapView> {
               ],
             ),
           ),
-
-          if (_nearbyUsers.isNotEmpty)
-            Positioned(
-              left: 16,
-              bottom: 24,
-              child: _SimilarityLegend(showActivity: !_showIndividualMarkers),
-            ),
         ],
       ),
     );
@@ -377,11 +732,13 @@ class _MapButton extends StatelessWidget {
     required this.icon,
     required this.onPressed,
     this.isPrimary = false,
+    this.showSpinner = false,
   });
 
   final IconData icon;
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
   final bool isPrimary;
+  final bool showSpinner;
 
   @override
   Widget build(BuildContext context) {
@@ -394,11 +751,20 @@ class _MapButton extends StatelessWidget {
         customBorder: const CircleBorder(),
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Icon(
-            icon,
-            size: 22,
-            color: isPrimary ? SparkColors.onAccent : SparkColors.title,
-          ),
+          child: showSpinner
+              ? SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: isPrimary ? SparkColors.onAccent : SparkColors.accent,
+                  ),
+                )
+              : Icon(
+                  icon,
+                  size: 22,
+                  color: isPrimary ? SparkColors.onAccent : SparkColors.title,
+                ),
         ),
       ),
     );
@@ -471,10 +837,15 @@ class _StatusPill extends StatelessWidget {
 /// that scales from blue (less similar) to red (more similar) based on
 /// [MapUserModel.similarity].
 class _NearbyUserMarker extends StatelessWidget {
-  const _NearbyUserMarker({required this.user, required this.onTap});
+  const _NearbyUserMarker({
+    required this.user,
+    required this.onTap,
+    this.showLiveBadge = false,
+  });
 
   final MapUserModel user;
   final VoidCallback onTap;
+  final bool showLiveBadge;
 
   @override
   Widget build(BuildContext context) {
@@ -486,7 +857,9 @@ class _NearbyUserMarker extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Tooltip(
-        message: '${user.name} · ${(user.similarity * 100).round()}% match',
+        message: showLiveBadge
+            ? '${user.name} · checked in live'
+            : '${user.name} · ${(user.similarity * 100).round()}% match',
         child: RepaintBoundary(
           child: SizedBox(
             width: 64,
@@ -502,8 +875,10 @@ class _NearbyUserMarker extends StatelessWidget {
                     shape: BoxShape.circle,
                     gradient: RadialGradient(
                       colors: [
-                        heatColor.withValues(alpha: 0.65),
-                        heatColor.withValues(alpha: 0.0),
+                        (showLiveBadge ? SparkColors.accent : heatColor)
+                            .withValues(alpha: 0.65),
+                        (showLiveBadge ? SparkColors.accent : heatColor)
+                            .withValues(alpha: 0.0),
                       ],
                     ),
                   ),
@@ -516,7 +891,10 @@ class _NearbyUserMarker extends StatelessWidget {
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     color: SparkColors.surfaceElevated,
-                    border: Border.all(color: heatColor, width: 2.5),
+                    border: Border.all(
+                      color: showLiveBadge ? SparkColors.accent : heatColor,
+                      width: 2.5,
+                    ),
                     boxShadow: const [
                       BoxShadow(color: Colors.black38, blurRadius: 4),
                     ],
@@ -530,87 +908,23 @@ class _NearbyUserMarker extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (showLiveBadge)
+                  Positioned(
+                    right: 6,
+                    bottom: 6,
+                    child: Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: SparkColors.accent,
+                        border: Border.all(color: Colors.white, width: 1.5),
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Legend for the cyan → red ramp. Zoomed out this is people density;
-/// zoomed in it matches the profile-similarity pin colors.
-class _SimilarityLegend extends StatelessWidget {
-  const _SimilarityLegend({required this.showActivity});
-
-  final bool showActivity;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: SparkColors.surfaceElevated.withValues(alpha: 0.94),
-      borderRadius: BorderRadius.circular(14),
-      elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              showActivity ? 'Activity' : 'Profile match',
-              style: const TextStyle(
-                color: SparkColors.title,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 6),
-            Container(
-              width: 110,
-              height: 6,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(3),
-                gradient: LinearGradient(
-                  colors: showActivity
-                      ? const [
-                          Colors.lightBlue,
-                          Colors.cyan,
-                          Colors.yellow,
-                          Colors.orange,
-                          Colors.red,
-                        ]
-                      : [
-                          similarityHeatColor(0),
-                          similarityHeatColor(0.35),
-                          similarityHeatColor(0.65),
-                          similarityHeatColor(1),
-                        ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  showActivity ? 'Quiet' : 'Less alike',
-                  style: const TextStyle(
-                    color: SparkColors.placeholder,
-                    fontSize: 9,
-                  ),
-                ),
-                Text(
-                  showActivity ? 'Busy' : 'More alike',
-                  style: const TextStyle(
-                    color: SparkColors.placeholder,
-                    fontSize: 9,
-                  ),
-                ),
-              ],
-            ),
-          ],
         ),
       ),
     );
