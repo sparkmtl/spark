@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../controllers/new_password_controller.dart';
 import '../theme/spark_colors.dart';
 import '../widgets/spark_auth_scaffold.dart';
-import '../widgets/spark_snackbar.dart';
 import '../widgets/spark_text_field.dart';
 import 'login_view.dart';
 
@@ -56,11 +55,14 @@ class _NewPasswordViewState extends State<NewPasswordView> {
       (_) => false,
     );
 
-    showSparkSnackBarOn(
-      messenger,
-      'Password updated. Please log in.',
-      backgroundColor: SparkColors.surfaceElevated,
-      textStyle: const TextStyle(color: SparkColors.title),
+    messenger.showSnackBar(
+      const SnackBar(
+        backgroundColor: SparkColors.surfaceElevated,
+        content: Text(
+          'Password updated. Please log in.',
+          style: TextStyle(color: SparkColors.title),
+        ),
+      ),
     );
   }
 

@@ -4,7 +4,6 @@ import 'package:flutter/services.dart';
 import '../controllers/profile_controller.dart';
 import '../models/profile_model.dart';
 import '../theme/spark_colors.dart';
-import '../widgets/spark_snackbar.dart';
 import '../widgets/spark_text_field.dart';
 
 class ProfileView extends StatefulWidget {
@@ -83,7 +82,9 @@ class _ProfileViewState extends State<ProfileView> {
         ? (_controller.saveMessage ?? 'Profile saved')
         : (_controller.saveMessage ?? 'Please fix the highlighted fields');
     final needsLogin = !ok && _controller.needsReauthentication;
-    showSparkSnackBar(context, message);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
     if (ok) {
       _syncFieldsFromModel();
     } else if (needsLogin) {

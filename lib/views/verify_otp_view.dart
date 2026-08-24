@@ -5,7 +5,6 @@ import '../controllers/verify_otp_controller.dart';
 import '../models/otp_flow.dart';
 import '../theme/spark_colors.dart';
 import '../widgets/spark_auth_scaffold.dart';
-import '../widgets/spark_snackbar.dart';
 import '../widgets/spark_text_field.dart';
 import 'login_view.dart';
 import 'new_password_view.dart';
@@ -62,11 +61,14 @@ class _VerifyOtpViewState extends State<VerifyOtpView> {
         MaterialPageRoute<void>(builder: (_) => const LoginView()),
         (_) => false,
       );
-      showSparkSnackBarOn(
-        messenger,
-        'Account created. Please log in.',
-        backgroundColor: SparkColors.surfaceElevated,
-        textStyle: const TextStyle(color: SparkColors.title),
+      messenger.showSnackBar(
+        const SnackBar(
+          backgroundColor: SparkColors.surfaceElevated,
+          content: Text(
+            'Account created. Please log in.',
+            style: TextStyle(color: SparkColors.title),
+          ),
+        ),
       );
       return;
     }
@@ -83,11 +85,14 @@ class _VerifyOtpViewState extends State<VerifyOtpView> {
     final ok = await _controller.resend();
     if (!mounted || !ok) return;
     _otpTextController.clear();
-    showSparkSnackBar(
-      context,
-      'A new OTP was sent to your email.',
-      backgroundColor: SparkColors.surfaceElevated,
-      textStyle: const TextStyle(color: SparkColors.title),
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        backgroundColor: SparkColors.surfaceElevated,
+        content: Text(
+          'A new OTP was sent to your email.',
+          style: TextStyle(color: SparkColors.title),
+        ),
+      ),
     );
   }
 

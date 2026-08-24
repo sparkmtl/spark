@@ -8,7 +8,6 @@ class MapUserModel {
     required this.longitude,
     required this.similarity,
     this.age,
-    this.isCheckedInUser = false,
   });
 
   final String id;
@@ -17,7 +16,6 @@ class MapUserModel {
   final double latitude;
   final double longitude;
   final double similarity;
-  final bool isCheckedInUser;
 
   factory MapUserModel.fromJson(Map<String, dynamic> json) {
     return MapUserModel(
@@ -27,18 +25,6 @@ class MapUserModel {
       latitude: (json['latitude'] as num?)?.toDouble() ?? 0,
       longitude: (json['longitude'] as num?)?.toDouble() ?? 0,
       similarity: ((json['similarity'] as num?)?.toDouble() ?? 0).clamp(0, 1),
-    );
-  }
-
-  factory MapUserModel.fromCheckInJson(Map<String, dynamic> json) {
-    return MapUserModel(
-      id: '${json['id']}',
-      name: json['name'] as String? ?? '',
-      age: json['age'] as int?,
-      latitude: (json['latitude'] as num?)?.toDouble() ?? 0,
-      longitude: (json['longitude'] as num?)?.toDouble() ?? 0,
-      similarity: ((json['similarity'] as num?)?.toDouble() ?? 0).clamp(0, 1),
-      isCheckedInUser: true,
     );
   }
 }
