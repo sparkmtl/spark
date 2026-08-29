@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
-
 import '../models/map_user_model.dart';
 import '../services/chat_api.dart';
 import '../services/check_in_api.dart';
@@ -20,6 +19,16 @@ import 'conversation_view.dart';
 /// Below this zoom, show density heat only (Snap Map style). At/above it,
 /// reveal individual profile pins on top of the heat.
 const double _markerRevealZoom = 12.0;
+
+/// Skip local auto-checkout briefly after check-in so a stale last-known
+/// anchor is not immediately invalidated by a fresh GPS fix.
+const Duration _checkInAutoCheckoutGrace = Duration(seconds: 45);
+
+/// Horizontal accuracy (meters) required before local auto-checkout may fire.
+const double _autoCheckoutMaxAccuracyMeters = 50.0;
+
+/// How often peer polling also reconciles check-in status with the server.
+const int _statusReconcileEveryNPolls = 8;
 
 class MapView extends StatefulWidget {
   const MapView({super.key});
@@ -46,7 +55,6 @@ class _MapViewState extends State<MapView> {
   double _mapZoom = MapConfig.defaultZoom;
 
   bool _isCheckedIn = false;
-  bool _isCheckInBusy = false;
   String? _checkInMessage;
   LatLng? _checkInAnchor;
   List<MapUserModel> _checkedInUsers = [];
@@ -55,6 +63,14 @@ class _MapViewState extends State<MapView> {
   Timer? _statusMessageTimer;
   DateTime? _lastLocationPushAt;
   LatLng? _lastPushedLocation;
+  /// Bumped on user check-in/out so async stale-clear cannot clobber local state.
+  int _checkInEpoch = 0;
+  /// In-flight POST /api/check-in; awaited before DELETE on checkout.
+  Future<void>? _persistCheckInFuture;
+  /// True when a local checkout still needs a successful server DELETE.
+  bool _checkoutNeedsRetry = false;
+  DateTime? _checkInGraceUntil;
+  int _checkInPollCount = 0;
 
   bool get _showIndividualMarkers => _mapZoom >= _markerRevealZoom;
 
@@ -73,30 +89,32 @@ class _MapViewState extends State<MapView> {
     super.initState();
     _locateUser();
     _loadNearbyUsers();
-    _restoreCheckInStatus();
+    // Do not restore a previous check-in after login — start unchecked.
+    // Clear any leftover active check-in from a prior session.
+    _clearStaleCheckInOnOpen();
   }
 
-  Future<void> _restoreCheckInStatus() async {
+  /// Ensures the user is not left checked in from a previous session when the
+  /// map opens after login. Check-in must be an explicit button action.
+  /// Skips entirely if the user already checked in/out while this was in flight.
+  Future<void> _clearStaleCheckInOnOpen() async {
+    final epoch = _checkInEpoch;
     try {
       final status = await _checkInApi.getCheckInStatus();
-      if (!mounted || !status.checkedIn) return;
-
-      final anchor = status.anchorLatitude != null &&
-              status.anchorLongitude != null
-          ? LatLng(status.anchorLatitude!, status.anchorLongitude!)
-          : null;
-
-      setState(() {
-        _isCheckedIn = true;
-        _checkInAnchor = anchor;
-      });
-      _showCheckInMessage('Checked in — sharing live location');
-      _startLocationTracking();
-      _startCheckInPolling();
-      _loadCheckedInUsers();
+      if (!mounted || epoch != _checkInEpoch || _isCheckedIn) return;
+      if (status.checkedIn) {
+        await _checkInApi.checkOut();
+      }
     } catch (_) {
-      // Best-effort restore; user can check in again manually.
+      // Best-effort; local UI stays unchecked either way.
     }
+    if (!mounted || epoch != _checkInEpoch || _isCheckedIn) return;
+    setState(() {
+      _isCheckedIn = false;
+      _checkInAnchor = null;
+      _checkedInUsers = [];
+    });
+    _stopCheckInPolling();
   }
 
   /// Shows a transient status pill that clears itself after [_notificationDuration].
@@ -140,8 +158,33 @@ class _MapViewState extends State<MapView> {
       _locationMessage = null;
     });
 
-    final result = await LocationService.getCurrentLocation();
+    // Seed the map immediately from last-known / quick fix so check-in and
+    // the blue dot are available without waiting on high-accuracy GPS.
+    final quick = await LocationService.getQuickLocation();
+    if (!mounted) return;
 
+    if (quick.isSuccess) {
+      final location =
+          LatLng(quick.position!.latitude, quick.position!.longitude);
+      setState(() {
+        _userLocation = location;
+        _center = location;
+        _isLocating = false;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _mapController.move(location, MapConfig.defaultZoom);
+      });
+      _lastLocationPushAt = DateTime.now();
+      _lastPushedLocation = location;
+      _shareLocation(location);
+      _startLocationTracking();
+      // Refine accuracy in the background; do not block the UI.
+      _refineLocationInBackground();
+      return;
+    }
+
+    // No quick fix — fall back to the slower high-accuracy path once.
+    final result = await LocationService.getCurrentLocation();
     if (!mounted) return;
 
     if (result.isSuccess) {
@@ -152,9 +195,6 @@ class _MapViewState extends State<MapView> {
         _center = location;
         _isLocating = false;
       });
-      // Defer until after the first frame: FlutterMap must be laid out at
-      // least once before its controller can be used (it's called from
-      // initState via _locateUser(), which can resolve before that happens).
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _mapController.move(location, MapConfig.defaultZoom);
       });
@@ -170,6 +210,20 @@ class _MapViewState extends State<MapView> {
         _showLocationMessage(_messageFor(result.failure!));
       }
     }
+  }
+
+  Future<void> _refineLocationInBackground() async {
+    final result = await LocationService.getCurrentLocation();
+    if (!mounted || !result.isSuccess) return;
+    final location =
+        LatLng(result.position!.latitude, result.position!.longitude);
+    setState(() {
+      _userLocation = location;
+      _center = location;
+    });
+    _lastLocationPushAt = DateTime.now();
+    _lastPushedLocation = location;
+    _shareLocation(location);
   }
 
   Future<void> _shareLocation(LatLng location) async {
@@ -200,7 +254,7 @@ class _MapViewState extends State<MapView> {
     if (!_isCheckedIn) return;
     try {
       final users = await _checkInApi.getCheckedInUsers();
-      if (!mounted) return;
+      if (!mounted || !_isCheckedIn) return;
       setState(() {
         _checkedInUsers = users;
       });
@@ -209,41 +263,63 @@ class _MapViewState extends State<MapView> {
     }
   }
 
-  Future<void> _toggleCheckIn() async {
-    if (_isCheckInBusy) return;
+  void _toggleCheckIn() {
     if (_isCheckedIn) {
-      await _performCheckOut(manual: true);
+      _performCheckOut();
     } else {
-      await _performCheckIn();
+      _performCheckIn();
     }
   }
 
-  Future<void> _performCheckIn() async {
-    _statusMessageTimer?.cancel();
-    setState(() {
-      _isCheckInBusy = true;
-      _checkInMessage = null;
-    });
-
-    final result = await LocationService.getCurrentLocation();
-    if (!mounted) return;
-
-    if (!result.isSuccess) {
-      setState(() {
-        _isCheckInBusy = false;
-      });
-      _showLocationMessage(_messageFor(result.failure!));
+  /// Instant local check-in when the blue-dot location is already on the map.
+  /// Never waits on GPS or the network before updating UI.
+  void _performCheckIn() {
+    final location = _userLocation;
+    if (location == null) {
+      _showLocationMessage('Wait for your location on the map, then check in.');
       return;
     }
 
-    final position = result.position!;
-    final location = LatLng(position.latitude, position.longitude);
+    _checkInEpoch++;
+    _checkoutNeedsRetry = false;
+    _checkInGraceUntil = DateTime.now().add(_checkInAutoCheckoutGrace);
+    _statusMessageTimer?.cancel();
+    setState(() {
+      _isCheckedIn = true;
+      _checkInAnchor = location;
+      _checkInMessage = null;
+    });
+    _showCheckInMessage('Checked in — sharing live location');
+    _startLocationTracking();
+    _startCheckInPolling();
+    unawaited(_loadCheckedInUsers());
+    final future = _persistCheckIn(location);
+    _persistCheckInFuture = future;
+    unawaited(future.whenComplete(() {
+      if (identical(_persistCheckInFuture, future)) {
+        _persistCheckInFuture = null;
+      }
+    }));
+  }
 
+  Future<void> _persistCheckIn(LatLng location) async {
+    final epoch = _checkInEpoch;
     try {
       final status = await _checkInApi.checkIn(
         latitude: location.latitude,
         longitude: location.longitude,
       );
+
+      // User checked out (or rolled back) while POST was in flight — clear
+      // the row we just created so it cannot become a ghost check-in.
+      if (epoch != _checkInEpoch || !_isCheckedIn) {
+        try {
+          await _checkInApi.checkOut();
+        } catch (_) {
+          // Idempotent server checkout; retry path may follow.
+        }
+        return;
+      }
       if (!mounted) return;
 
       setState(() {
@@ -252,40 +328,45 @@ class _MapViewState extends State<MapView> {
                 status.anchorLongitude != null
             ? LatLng(status.anchorLatitude!, status.anchorLongitude!)
             : location;
-        _userLocation = location;
-        _isCheckInBusy = false;
       });
-      _showCheckInMessage('Checked in — sharing live location');
-      _startLocationTracking();
-      _startCheckInPolling();
-      _loadCheckedInUsers();
+      unawaited(_loadCheckedInUsers());
     } on ApiException catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _isCheckInBusy = false;
-      });
+      if (!mounted || epoch != _checkInEpoch) return;
       if (e.statusCode == 409) {
         _showCheckInMessage('Already checked in');
-        await _syncCheckInStateFromServer();
+        unawaited(_syncCheckInStateFromServer(epoch: epoch));
         return;
       }
+      _rollbackOptimisticCheckIn();
       _showCheckInMessage("Couldn't check in. Try again.");
     } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _isCheckInBusy = false;
-      });
+      if (!mounted || epoch != _checkInEpoch) return;
+      _rollbackOptimisticCheckIn();
       _showCheckInMessage("Couldn't check in. Try again.");
     }
   }
 
+  void _rollbackOptimisticCheckIn() {
+    _checkInEpoch++;
+    _checkInGraceUntil = null;
+    _checkoutNeedsRetry = false;
+    _stopCheckInPolling();
+    setState(() {
+      _isCheckedIn = false;
+      _checkInAnchor = null;
+      _checkedInUsers = [];
+    });
+  }
+
   /// Aligns local check-in UI with [CheckInApi.getCheckInStatus].
-  Future<void> _syncCheckInStateFromServer() async {
+  /// Aborts if [epoch] no longer matches (e.g. user checked out mid-sync).
+  Future<void> _syncCheckInStateFromServer({required int epoch}) async {
     try {
       final status = await _checkInApi.getCheckInStatus();
-      if (!mounted) return;
+      if (!mounted || epoch != _checkInEpoch) return;
 
       if (!status.checkedIn) {
+        _checkInGraceUntil = null;
         _stopCheckInPolling();
         setState(() {
           _isCheckedIn = false;
@@ -315,42 +396,62 @@ class _MapViewState extends State<MapView> {
     }
   }
 
-  Future<void> _performCheckOut({
-    required bool manual,
-    bool autoCheckedOut = false,
-  }) async {
-    setState(() {
-      _isCheckInBusy = true;
-    });
-
+  /// Instant local checkout; server DELETE awaits in-flight POST then retries.
+  void _performCheckOut({bool autoCheckedOut = false}) {
+    final wasCheckedIn = _isCheckedIn;
+    _checkInEpoch++;
+    _checkInGraceUntil = null;
     // Keep the GPS stream running so map location continues to update.
     _stopCheckInPolling();
 
-    try {
-      if (_isCheckedIn) {
-        await _checkInApi.checkOut();
-      }
-    } catch (_) {
-      // Still clear local state so the UI reflects checkout.
-    }
-
-    if (!mounted) return;
     setState(() {
       _isCheckedIn = false;
       _checkInAnchor = null;
       _checkedInUsers = [];
-      _isCheckInBusy = false;
     });
 
     if (autoCheckedOut) {
       _showCheckInMessage('Moved 1 km away — checked out');
     } else {
-      _statusMessageTimer?.cancel();
-      setState(() {
-        _checkInMessage = null;
-        _locationMessage = null;
-      });
+      _showCheckInMessage('Checked out');
     }
+
+    if (wasCheckedIn || _checkoutNeedsRetry) {
+      _checkoutNeedsRetry = true;
+      unawaited(_finalizeCheckOutOnServer());
+    }
+  }
+
+  /// Waits for any in-flight check-in POST, then DELETE with retries.
+  Future<void> _finalizeCheckOutOnServer() async {
+    final pending = _persistCheckInFuture;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch (_) {
+        // Persist errors are handled inside _persistCheckIn.
+      }
+    }
+
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      if (!mounted) return;
+      try {
+        await _checkInApi.checkOut();
+        _checkoutNeedsRetry = false;
+        return;
+      } catch (_) {
+        if (attempt < maxAttempts - 1) {
+          await Future<void>.delayed(Duration(milliseconds: 300 * (attempt + 1)));
+        }
+      }
+    }
+    // Leave _checkoutNeedsRetry true so location ticks can retry.
+  }
+
+  Future<void> _retryCheckoutIfNeeded() async {
+    if (!_checkoutNeedsRetry || _isCheckedIn) return;
+    await _finalizeCheckOutOnServer();
   }
 
   /// Starts continuous GPS updates for the lifetime of this map (logged-in shell).
@@ -370,15 +471,64 @@ class _MapViewState extends State<MapView> {
 
   void _startCheckInPolling() {
     _stopCheckInPolling();
+    _checkInPollCount = 0;
     _checkInPollTimer = Timer.periodic(
       const Duration(seconds: 4),
-      (_) => _loadCheckedInUsers(),
+      (_) => _onCheckInPollTick(),
     );
   }
 
   void _stopCheckInPolling() {
     _checkInPollTimer?.cancel();
     _checkInPollTimer = null;
+    _checkInPollCount = 0;
+  }
+
+  Future<void> _onCheckInPollTick() async {
+    if (_checkoutNeedsRetry && !_isCheckedIn) {
+      await _retryCheckoutIfNeeded();
+      return;
+    }
+    if (!_isCheckedIn) return;
+
+    _checkInPollCount++;
+    await _loadCheckedInUsers();
+
+    // Every Nth poll, confirm the server still considers us checked in.
+    if (_checkInPollCount % _statusReconcileEveryNPolls == 0) {
+      await _reconcileCheckInStatusWithServer();
+    }
+  }
+
+  Future<void> _reconcileCheckInStatusWithServer() async {
+    final epoch = _checkInEpoch;
+    if (!_isCheckedIn) return;
+    try {
+      final status = await _checkInApi.getCheckInStatus();
+      if (!mounted || epoch != _checkInEpoch || !_isCheckedIn) return;
+      if (!status.checkedIn) {
+        _checkInGraceUntil = null;
+        _stopCheckInPolling();
+        setState(() {
+          _isCheckedIn = false;
+          _checkInAnchor = null;
+          _checkedInUsers = [];
+        });
+      }
+    } catch (_) {
+      // Keep local state on transient failures.
+    }
+  }
+
+  bool _shouldSkipLocalAutoCheckout(Position position) {
+    final graceUntil = _checkInGraceUntil;
+    if (graceUntil != null && DateTime.now().isBefore(graceUntil)) {
+      return true;
+    }
+    if (position.accuracy > _autoCheckoutMaxAccuracyMeters) {
+      return true;
+    }
+    return false;
   }
 
   Future<void> _onPositionUpdate(Position position) async {
@@ -388,13 +538,19 @@ class _MapViewState extends State<MapView> {
       setState(() => _userLocation = location);
     }
 
+    if (_checkoutNeedsRetry && !_isCheckedIn) {
+      unawaited(_retryCheckoutIfNeeded());
+    }
+
     // Check-in auto-checkout and live check-in location sharing.
-    if (_isCheckedIn && _checkInAnchor != null) {
+    if (_isCheckedIn &&
+        _checkInAnchor != null &&
+        !_shouldSkipLocalAutoCheckout(position)) {
       final distanceKm =
           LocationService.distanceKm(_checkInAnchor!, location);
 
       if (distanceKm >= checkInAutoCheckoutRadiusKm) {
-        await _performCheckOut(manual: false, autoCheckedOut: true);
+        _performCheckOut(autoCheckedOut: true);
         return;
       }
     }
@@ -429,7 +585,7 @@ class _MapViewState extends State<MapView> {
       );
 
       if (result.autoCheckedOut) {
-        await _performCheckOut(manual: false, autoCheckedOut: true);
+        _performCheckOut(autoCheckedOut: true);
       }
     } catch (_) {
       // Best-effort live check-in updates.
@@ -650,8 +806,7 @@ class _MapViewState extends State<MapView> {
                       ? Icons.location_on
                       : Icons.location_on_outlined,
                   isPrimary: _isCheckedIn,
-                  showSpinner: _isCheckInBusy,
-                  onPressed: _isCheckInBusy ? null : _toggleCheckIn,
+                  onPressed: _toggleCheckIn,
                 ),
                 const SizedBox(height: 10),
                 _MapButton(
@@ -732,13 +887,11 @@ class _MapButton extends StatelessWidget {
     required this.icon,
     required this.onPressed,
     this.isPrimary = false,
-    this.showSpinner = false,
   });
 
   final IconData icon;
   final VoidCallback? onPressed;
   final bool isPrimary;
-  final bool showSpinner;
 
   @override
   Widget build(BuildContext context) {
@@ -751,20 +904,11 @@ class _MapButton extends StatelessWidget {
         customBorder: const CircleBorder(),
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: showSpinner
-              ? SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: isPrimary ? SparkColors.onAccent : SparkColors.accent,
-                  ),
-                )
-              : Icon(
-                  icon,
-                  size: 22,
-                  color: isPrimary ? SparkColors.onAccent : SparkColors.title,
-                ),
+          child: Icon(
+            icon,
+            size: 22,
+            color: isPrimary ? SparkColors.onAccent : SparkColors.title,
+          ),
         ),
       ),
     );

@@ -70,6 +70,30 @@ abstract final class LocationService {
     }
   }
 
+  /// Instant / near-instant fix for check-in: last known, then a short
+  /// medium-accuracy one-shot. Never waits on the high-accuracy stream.
+  static Future<LocationResult> getQuickLocation() async {
+    try {
+      final permissionResult = await _ensurePermission();
+      if (permissionResult != null) return permissionResult;
+
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null) {
+        return LocationResult.success(lastKnown);
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+          timeLimit: Duration(seconds: 3),
+        ),
+      ).timeout(const Duration(seconds: 4));
+      return LocationResult.success(position);
+    } catch (_) {
+      return const LocationResult.failure(LocationFailure.unknown);
+    }
+  }
+
   /// Continuous high-accuracy updates for live map / check-in tracking.
   static Stream<Position> getPositionStream() {
     return Geolocator.getPositionStream(locationSettings: _streamSettings);
